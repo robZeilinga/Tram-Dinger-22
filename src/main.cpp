@@ -1,15 +1,22 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#ifdef ESP32
+  #include <WiFi.h>
+  #include <AsyncTCP.h>
+#else
+  #include <ESP8266WiFi.h>
+  #include <ESPAsyncTCP.h>
+#endif
+#include <ESPAsyncWebServer.h>
 
 // pin allocations 
-
 #define BTN D2
 #define LED_BLUE D7
 #define LED_RED D8
 #define LED_GREEN D6
 #define BELL D4
-#define NONE 99;
+#define NONE 99
 
 // run modes
 #define MODE_WAIT 0
@@ -19,7 +26,9 @@
 #define MODE_PEND_CONT 2
 #define MODE_PEND_ALARM 8
 
-
+// Wifi Modes
+#define WIFI_DEV 0
+#define WIFI_PROD 1
 
 int mode = -1;
 
@@ -31,6 +40,10 @@ int mode = -1;
 int BELL_ON = LOW;
 int BELL_OFF = HIGH;
 
+int prefs_ding_time = -1;
+int prefs_ding_off_time = -1;
+int prefs_ding_pause_time = -1;
+
 int settings_ding_time = -1;
 int settings_ding_off_time = -1;
 int settings_ding_pause_time = -1;
@@ -40,6 +53,55 @@ String actionString_DingDing = "";
 String actionString_Cont = "";
 String actionString = "";
 
+
+// HTML web page to handle 3 input fields (input1, input2, input3)
+const char index_html[]  = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+  <title>ESP Input Form</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  </head><body>
+  <form action="/get">
+  <div>To Test Values, Press Hardware Button</div>
+  <table>
+  <tr>
+  <th> Description </th><th> Stored Value</th><th>Current Value</th></tr>
+    <tr><td>Bell On Time [1-20] units of 100ms (0.1s) 1 == .1s : </td><td>%PREFS_ON_TIME%</td><td><input type="text" name="dingOnTime" id="dingOnTime" value="%ON_TIME%"></td></tr>
+    <tr><td>Bell Off Time ( between the two rings) [1-20] 2 = .2s : </td><td>%PREFS_OFF_TIME%</td><td><input type="text" name="dingOffTime" id="dingOffTime" value="%OFF_TIME%"></td></tr>
+    <tr><td>Cycle Pause Time ( between sets of rings in Repeat Mode) : </td><td>%PREFS_PAUSE_TIME%</td><td><input type="text" name="dingPauseTime" id="dingPauseTime" value="%PAUSE_TIME%" ></td></tr>
+    <tr><td colspan="3"><input type="submit" value="Change Values"></form></td></tr>
+    <tr><td colspan="3"><form action="/revert"><input type="submit" value="Revert Settings To Stored"></form></td></tr>
+    </table>
+  </br>
+  <form action="/toggle" ><input type="submit" value="Toggle Bell Polarity"></form>
+  <div> <b><i> NOTE: Changing the Values Above are NOT stored ! ( i.e. Losing Power will revert the Values to those SAVED to Persistant Memory) </i></b></br>
+  To Save the Values to Persistant Memory, Press the Store Button Below.</br>
+  <form action="/store">
+  <input type="submit" value="STORE"></form></div></br>   
+  
+
+  </body></html>)rawliteral";
+
+String processor(const String& var) {
+    if (var =="ON_TIME"){
+        return String(settings_ding_time);
+    }
+    if(var == "OFF_TIME"){
+        return String(settings_ding_off_time);
+    }
+    if(var == "PAUSE_TIME"){
+        return String(settings_ding_pause_time);
+    }
+    if(var == "PREFS_ON_TIME"){
+        return String(prefs_ding_time);
+    }
+    if(var == "PREFS_OFF_TIME"){
+        return String(prefs_ding_off_time);
+    }
+    if(var =="PREFS_PAUSE_TIME"){
+        return String(prefs_ding_pause_time);
+    }
+    return String();
+}
 
 int PRV_BTN_STATE = 0;
 long old_millis = 0;
@@ -51,13 +113,28 @@ long unsigned time_to_wait = 0;
 bool doSequence = false;
 
 Preferences prefs;
-
+AsyncWebServer server(80);
 
 
 void ledColour(int val){
     digitalWrite(LED_BLUE, val == LED_BLUE ? HIGH:LOW );
     digitalWrite(LED_RED, val == LED_RED ? HIGH:LOW );
     digitalWrite(LED_GREEN, val == LED_GREEN ? HIGH:LOW );
+}
+
+void reloadBellPolarity(){
+    if(settings_invert_bell){
+        BELL_OFF = LOW;
+        BELL_ON = HIGH;
+    } else {
+        BELL_OFF = HIGH;
+        BELL_ON = LOW;
+
+    }
+}
+
+void notFound(AsyncWebServerRequest *request){
+    request->send(404,"text/plain","Not Found");
 }
 
 void buildActionSequences(){
@@ -126,16 +203,59 @@ void setup(){
 
         // get Prefernces 
         prefs.begin("TramDinger",false); // use "my-app" namespace
-        bool settings_invert_bell = prefs.getBool("invertBell", false);
+
+        // Prefs helper Scripts ( uncomment as needed ) _ NB DONT FORGET TO RE_COMMENT !! 
+        // ========================================================
+        // Clear all keys 
+        // prefs.clear();
+        // ------------------------------------
+        // Procedure to Set DEV ssid & Password
+        // ------------------------------------ 
+        // 1. Uncomment lines below and replace with your network's details
+        // 2. Save, upload & reset the 8266.  Your Network Creds will be set in Preferences 
+        // 3. REVERT and RE-COMMENT the lines below & save Code. 
+        //  NB NB NB - DON'T COMMIT CODE TO YOUR REPO WITH YOUR CREDS IN PLAIN TEXT!!!!!
+        // 
+        // Creds are stored in the Preferences area. 
+        // 
+        // and yes, i could of written a special hidden page to allow the user to enter the creds 
+        // - but that is a lot of work for a setting that is only used once.
+        
+        //prefs.remove("DEV_SSID");
+        //prefs.remove("DEV_PSK");
+
+        // prefs.putString("DEV_SSID", "<<Your DEV SSID Here>>");
+        // prefs.putString("DEV_PSK", "<<Your DEV Network Passord Here>>");
+
+
+        // ============================================================
+        // Rename Soft AP - PROD SSID ( the 8266's Network )
+        // ---------------------------------------
+        // 
+        // prefs.putString("PROD_SSID", "Tram Dinger");
+        // prefs.putString("PROD_PSK", "Secret");
+        // ========================================
+        // Hide / Show PROD SSID 
+        //----------------
+        // prefs.putInt("PROD_WIFI_HIDDEN", 0);   // 0 == Visible, 1 == Hidden
+        
+
+
+
+       // bool settings_invert_bell = prefs.getBool("invertBell", false);
 
         settings_ding_time = prefs.getInt("dingTime", 1);
         settings_ding_off_time = prefs.getInt("dingOffTime", 2);
         settings_ding_pause_time = prefs.getInt("dingPauseTime", 7);
 
-        if(settings_invert_bell){
-            BELL_OFF = LOW;
-            BELL_ON = HIGH;
-        }
+        prefs_ding_time = settings_ding_time;
+        prefs_ding_off_time = settings_ding_off_time;
+        prefs_ding_pause_time = settings_ding_pause_time;
+
+        reloadBellPolarity();
+
+      
+
 
         //while(Serial.available() == 0) { }
         //Serial.println("hello world!");
@@ -168,6 +288,107 @@ void setup(){
         buildActionSequences();
 
         delay(1000);
+
+        // WIFI Connection Settings 
+        int settings_wifi_mode = prefs.getInt("WifiMode", WIFI_PROD);  
+        settings_wifi_mode = WIFI_DEV;
+        bool Wifi_UP = false;
+        if(settings_wifi_mode == WIFI_PROD){
+            //  MODE 
+            String settings_wifi_prod_ssid = prefs.getString("PROD_SSID", "TramDinger");
+            String settings_wifi_prod_psk = prefs.getString("PROD_PSK", "");
+            int settings_wifi_prod_hidden = prefs.getInt("PROD_WIFI_HIDDEN", 0);  // 1 == hidden
+            Serial.print("Setting soft-AP ... ");
+            Serial.print(settings_wifi_prod_ssid);
+            Serial.print(" .... ");
+            Wifi_UP = WiFi.softAP(settings_wifi_prod_ssid, settings_wifi_prod_psk,1,settings_wifi_prod_hidden);
+            
+            Serial.println(Wifi_UP ? "Ready" : "Failed!");  // hidden AP
+
+            if(!Wifi_UP){
+                // turn on RED LED & wait 
+                ledColour(LED_RED);
+                while(1){}
+            } else {
+                Serial.print("Soft-AP IP address = ");
+                Serial.println(WiFi.softAPIP()); // default is 192.168.4.1.
+            }
+        } else {
+            // DEV MODE
+            String settings_wifi_dev_ssid = prefs.getString("DEV_SSID", "");
+            String settings_wifi_dev_psk = prefs.getString("DEV_PSK","");
+            if(settings_wifi_dev_ssid == ""){
+                // invalid - revert to PROD mode 
+                Serial.println("No DEV SSID Found, Rev erting to PROD MODE");
+                settings_wifi_mode = WIFI_PROD;
+            } else {
+
+            WiFi.begin(settings_wifi_dev_ssid, settings_wifi_dev_psk);
+            Serial.print("Connecting");
+            while (WiFi.status() != WL_CONNECTED)
+            {
+                delay(250);
+                Serial.print(".");
+                ledColour(LED_GREEN);
+                delay(250);
+                ledColour(NONE);    
+
+            }
+            ledColour(NONE);
+            Serial.println();
+
+            Serial.print("Connected, IP address: ");
+            Serial.println(WiFi.localIP());
+            }
+        }
+
+        // =========================================================
+        // Server routes
+        // =========================================================
+
+        server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+            request->send_P(200,"text/html",index_html, processor);
+        });
+
+        server.on("/get", HTTP_GET, [] (AsyncWebServerRequest *request){
+            if(request->hasParam("dingOnTime")) settings_ding_time = request->getParam("dingOnTime")->value().toInt();
+            if(request->hasParam("dingOffTime")) settings_ding_off_time = request->getParam("dingOffTime")->value().toInt();
+            if(request->hasParam("dingPauseTime")) settings_ding_pause_time = request->getParam("dingPauseTime")->value().toInt();
+            buildActionSequences();
+            request->send_P(200,"text/html",index_html, processor);
+        });
+
+        server.on("/revert", HTTP_GET, [] (AsyncWebServerRequest *request){
+            settings_ding_time = prefs_ding_time;
+            settings_ding_off_time = prefs_ding_off_time;
+            settings_ding_pause_time = prefs_ding_pause_time;
+            buildActionSequences();
+            request->send_P(200,"text/html",index_html, processor);
+        });
+
+        server.on("/store", HTTP_GET, [] (AsyncWebServerRequest *request){
+            prefs.putInt("dingTime", settings_ding_time);
+            prefs.putInt("dingOffTime", settings_ding_off_time);
+            prefs.putInt("dingPauseTime", settings_ding_pause_time);
+            prefs_ding_time = settings_ding_time;
+            prefs_ding_off_time = settings_ding_off_time;
+            prefs_ding_pause_time = settings_ding_pause_time;
+            request->send_P(200,"text/html",index_html, processor);
+
+            // TODO: check out https://randomnerdtutorials.com/esp32-esp8266-input-data-html-form/ the second part shows Async updates without refresh 
+
+        });
+
+        server.on("/toggle", HTTP_GET, [] (AsyncWebServerRequest *request){
+            bool oldValue = prefs.getBool("invertBell", false);
+            prefs.putBool("invertBell", !oldValue);
+            settings_invert_bell = !oldValue;
+            reloadBellPolarity();
+            request->send_P(200,"text/html",index_html, processor);
+        });
+
+        server.onNotFound(notFound);
+        server.begin();
 
         // wait for btn press and release 
         bool startCheck = false;
@@ -355,6 +576,10 @@ void loop(){
                         break;
                     case 'R':
                         Serial.println("Action Char = R : re-Starting Sequence");
+                        // edge case - check if ActionString has changed
+                        if (mode == MODE_CONT){
+                            actionString = actionString_Cont;
+                        }
                         seq_Step = 0;
                         time_to_wait = 0;
                         break;
