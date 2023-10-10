@@ -239,8 +239,11 @@ void setup(){
         //----------------
         // prefs.putInt("PROD_WIFI_HIDDEN", 0);   // 0 == Visible, 1 == Hidden
         
-
-
+        // =====================================
+        // Switch between PROD & DEV
+        // ------------------------------------
+        // prefs.putInt("WifiMode", WIFI_PROD);   // WIFI_PROD or WIFI_DEV
+        
 
        // bool settings_invert_bell = prefs.getBool("invertBell", false);
 
